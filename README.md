@@ -24,7 +24,7 @@ This is a fork of [gac3k/xdg-desktop-portal-hypr-remote](https://github.com/gac3
 
 Dependencies: cmake, pkg-config, a C/C++ compiler, wayland, wayland-protocols, libei (libei and libeis), sdbus-c++ 2.x, systemd.
 
-`DEVELOPMENT_MODE` defaults to ON, which uses a `.dev` D-Bus name. Turn it off for a real install:
+`DEVELOPMENT_MODE` (default ON) only adds a compile definition; the D-Bus name is always `org.freedesktop.impl.portal.desktop.hypr-remote`. A release install:
 
 ```bash
 cmake -B build -DDEVELOPMENT_MODE=OFF -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBEXECDIR=lib
