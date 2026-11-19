@@ -842,16 +842,15 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         close(server_fd);
     }).detach();
     
-    // Return the client file descriptor to deskflow
+    // Return the client file descriptor to deskflow. UnixFd adopts client_fd
+    // (no dup) and closes it when it goes out of scope, after the reply is sent;
+    // the bus has its own copy by then. client_fd must not be closed elsewhere.
+    sdbus::UnixFd unix_fd{client_fd, sdbus::adopt_fd};
     auto reply = call.createReply();
-    
-    // Create a unix file descriptor object and pass it to the client
-    sdbus::UnixFd unix_fd{client_fd};
     reply << unix_fd;
     reply.send();
     
     std::cout << "✅ ConnectToEIS completed - socket fd sent to deskflow" << std::endl;
-    std::cout << "🎯 Deskflow can now send EIS events through fd " << client_fd << std::endl;
     std::cout << "📡 Proper EIS server thread is running with socket bridge" << std::endl;
 }
 
@@ -893,6 +892,7 @@ void Portal::handle_eis_event(struct eis_event* event) {
             eis_seat_configure_capability(seat, EIS_DEVICE_CAP_BUTTON);
             eis_seat_configure_capability(seat, EIS_DEVICE_CAP_SCROLL);
             eis_seat_add(seat);
+            eis_seat_unref(seat);  // the client keeps its own reference
             
             std::cout << "💺 EIS: Seat added for client with capabilities" << std::endl;
             break;
@@ -923,9 +923,11 @@ void Portal::handle_eis_event(struct eis_event* event) {
                           << " across " << layout.monitors.size() << " monitor(s)" << std::endl;
             }
             eis_region_add(region);
+            eis_region_unref(region);
             
             eis_device_add(pointer);
             eis_device_resume(pointer);
+            eis_device_unref(pointer);
             
             // Add keyboard device with proper keymap setup
             struct eis_device* keyboard = eis_seat_new_device(seat);
@@ -952,6 +954,7 @@ void Portal::handle_eis_event(struct eis_event* event) {
                         EIS_KEYMAP_TYPE_XKB, memfd, keymap_size);
                     if (keymap) {
                         eis_keymap_add(keymap);
+                        eis_keymap_unref(keymap);
                         std::cout << "🗝️ EIS: Keymap configured for proper modifier handling" << std::endl;
                     }
                 }
@@ -960,6 +963,7 @@ void Portal::handle_eis_event(struct eis_event* event) {
             
             eis_device_add(keyboard);
             eis_device_resume(keyboard);
+            eis_device_unref(keyboard);
             
             std::cout << "🖱️ EIS: Pointer and keyboard devices added with enhanced features" << std::endl;
             break;
