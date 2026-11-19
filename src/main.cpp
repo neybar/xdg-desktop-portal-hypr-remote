@@ -6,13 +6,16 @@
 #include <iostream>
 #include <thread>
 #include <signal.h>
+#include <csignal>
 #include <chrono>
 
-static bool running = true;
+static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t received_signal = 0;
 
+// Async-signal-safe: only store the flags, no I/O.
 void signal_handler(int signal) {
-    std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
-    running = false;
+    received_signal = signal;
+    running = 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -64,7 +67,6 @@ int main(int argc, char* argv[]) {
     
     std::cout << "✓ LibEI handler started and ready for connections" << std::endl;
     
-    // Initialize portal
     // Initialize portal; it also initializes the clipboard (clipboard.h, item 9)
     if (!portal.init(&libeiHandler, &clipboard)) {
         std::cerr << "Failed to initialize D-Bus portal" << std::endl;
@@ -92,6 +94,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
+    std::cout << "\nReceived signal " << static_cast<int>(received_signal) << ", shutting down..." << std::endl;
     std::cout << "\nShutting down components..." << std::endl;
     
     // Stop and cleanup

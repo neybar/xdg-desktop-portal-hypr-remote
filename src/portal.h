@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sdbus-c++/sdbus-c++.h>
+#include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,20 +32,25 @@ private:
     std::unique_ptr<sdbus::IObject> object;
     LibEIHandler* libei_handler;
     WaylandClipboard* clipboard = nullptr;
-    bool running;
 
     // Session table (clipboard.h, item 3). Never call into `clipboard` or emit a
     // signal while holding sessions_mtx.
     struct SessionState {
         bool clipboard_requested = false;
-        bool started = false;
+        bool allowed = false;   // Start accepted this session's app_id
         std::unique_ptr<sdbus::IObject> obj;   // org.freedesktop.impl.portal.Session
     };
     std::mutex sessions_mtx;
     std::map<std::string, SessionState> sessions;
     std::vector<std::unique_ptr<sdbus::IObject>> retired;  // closed Session objects
     std::string clip_session;                              // "" = none
-    
+
+    // EIS server threads (one per ConnectToEIS). cleanup() waits for them.
+    std::atomic<bool> eis_shutdown{false};
+    std::mutex eis_mtx;
+    std::condition_variable eis_cv;
+    int eis_threads = 0;   // guarded by eis_mtx
+
     // Modifier state tracking for proper key combination handling
     uint32_t modifier_state_depressed = 0;
     uint32_t modifier_state_latched = 0;
@@ -62,7 +69,6 @@ private:
     
     // D-Bus method handlers
     void CreateSession(sdbus::MethodCall call);
-    void SelectSources(sdbus::MethodCall call);
     void SelectDevices(sdbus::MethodCall call);
     void Start(sdbus::MethodCall call);
     

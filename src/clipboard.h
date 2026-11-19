@@ -40,7 +40,7 @@
  *  - `object` must outlive the thread: clipboard.stop() runs before portal.cleanup().
  *
  * 3. SESSIONS (Portal): std::map<std::string, SessionState> under sessions_mtx,
- *    SessionState{bool clipboard_requested, started; unique_ptr<IObject> obj}.
+ *    SessionState{bool clipboard_requested; unique_ptr<IObject> obj}.
  *  - xdg-desktop-portal 1.22.1 (src/xdp-session.c, xdp_session_close) calls
  *    impl.portal.Session.Close synchronously at session_handle, both on Close and
  *    when the client disconnects. Today that gets UnknownObject. Decision:
@@ -49,10 +49,11 @@
  *    obj into `retired`, because an object must not be destroyed inside its own
  *    callback. `retired` is cleared at the next CreateSession.
  *  - RequestClipboard and Start on an unknown handle create the entry.
- *  - The clipboard session is the most recently Started entry with both flags set,
+ *  - The clipboard session is the most recently Started entry that requested the clipboard,
  *    kept as `clip_session` ("" = none). Only it receives signals and may use the
  *    clipboard methods. Any other handle gets org.freedesktop.portal.Error.Failed.
- *    When it closes: clip_session = "" and clipboard->session_ended(). Entries left
+ *    When it closes, or another session's Start replaces it: clip_session = ... and
+ *    clipboard->session_ended(). Entries left
  *    behind by a frontend crash (no Close) are harmless; the next Start takes over.
  *
  * 4. MAC -> LAPTOP (Synergy owns the selection)
@@ -107,6 +108,9 @@
  * 6. LIMITS: with (b) there is no portal-side size cap (we never see the bytes);
  *    Synergy's clipboardSharingSize applies. 5 s deadline for SelectionWrite. main
  *    still sets signal(SIGPIPE, SIG_IGN): the EIS bridge write()s to sockets.
+ *    MIME types must be 1-255 bytes of printable ASCII (0x20-0x7E); at most 64 per
+ *    selection; others are dropped. At most 32 pastes pending; more are refused
+ *    (empty paste).
  * 7. LOGGING: lifecycle events, plus one line per transfer with direction, mime,
  *    serial and outcome (handed over / done ok / failed / timed out). Sizes aren't
  *    known under (b). Never log contents. Required lines: "clipboard requested",
@@ -123,6 +127,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -141,6 +146,10 @@ struct ext_data_control_source_v1;
 struct ext_data_control_offer_v1;
 
 inline constexpr const char* kOwnedMarker = "application/x-hypr-remote-owned";
+inline constexpr size_t kMaxMimeLen = 255, kMaxMimeTypes = 64, kMaxPending = 32;
+
+// 1..kMaxMimeLen bytes, each printable ASCII (0x20-0x7E).
+bool valid_mime_type(const std::string& mime);
 
 // Called on the Wayland thread, never with a WaylandClipboard lock held.
 struct ClipboardCallbacks {
@@ -184,6 +193,7 @@ private:
     void on_send(ext_data_control_source_v1* source, const char* mime, int fd);
     void destroy_offer(ext_data_control_offer_v1* offer);
     void expire_pending();
+    void note_failed(uint32_t serial);                // mtx_ held
     int  poll_timeout_ms();
     void teardown_wayland();                          // Wayland thread, or init() before it starts
 
@@ -196,6 +206,7 @@ private:
     bool loop_exited_ = true;                         // no thread to run commands: close fds at once
     std::deque<Command> commands_;
     std::map<uint32_t, Pending> pending_;
+    std::deque<uint32_t> failed_serials_;             // recently closed without a hand-over, max 32
     uint32_t serial_counter_ = 0;
     std::vector<std::string> foreign_mimes_;          // copy of the current foreign offer's types
 
@@ -206,6 +217,7 @@ private:
     ext_data_control_manager_v1* manager_ = nullptr;
     ext_data_control_device_v1* device_ = nullptr;
     ext_data_control_source_v1* source_ = nullptr;    // our current source, if any
+    std::vector<std::string> claimed_mimes_;          // types source_ offers, without the marker
     ext_data_control_offer_v1* selection_offer_ = nullptr;
     std::map<ext_data_control_offer_v1*, std::vector<std::string>> offers_;
 };

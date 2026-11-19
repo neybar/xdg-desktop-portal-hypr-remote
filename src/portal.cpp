@@ -10,18 +10,15 @@
 #include <cstring>
 #include <cerrno>
 #include <unistd.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <poll.h>
 #include <algorithm>
 #include <sys/mman.h>
-#include <fcntl.h>
 
 extern "C" {
 #include <libei.h>
 #include "libei-1.0/libeis.h"
 #include <wayland-client-protocol.h>
+}
 
 // ---- Monitor layout (hypr-remote local patch) ----------------------------
 // Synergy/Deskflow sends absolute positions within one rectangle. Hyprland
@@ -30,6 +27,7 @@ extern "C" {
 // of a non-rectangular layout. We advertise the real bounding box and clamp
 // every absolute position onto the nearest monitor.
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 #include <mutex>
@@ -43,7 +41,7 @@ struct Layout {
 
 Layout parse_hyprctl_monitors() {
     Layout layout;
-    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "r");
+    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "re");
     if (!pipe) return layout;
     std::vector<LayoutRect> rects;
     char line[512];
@@ -89,15 +87,11 @@ Layout g_layout;
 // Positions that fall in dead space are clamped onto this monitor, so the
 // cursor slides along its edge instead of jumping to whichever monitor is nearest.
 int g_current_monitor = -1;
-std::chrono::steady_clock::time_point g_layout_time{};
-
 Layout current_layout(bool force = false) {
     std::lock_guard<std::mutex> lock(g_layout_mutex);
-    auto now = std::chrono::steady_clock::now();
-    if (force || g_layout.monitors.empty() || now - g_layout_time > std::chrono::seconds(2)) {
+    if (force || g_layout.monitors.empty()) {
         Layout fresh = parse_hyprctl_monitors();
         if (!fresh.monitors.empty()) g_layout = fresh;
-        g_layout_time = now;
     }
     return g_layout;
 }
@@ -172,7 +166,6 @@ void track_absolute(const Layout& layout, double& x, double& y) {
     g_abs = {true, rx, ry, x, y};
 }
 } // namespace
-}
 
 static const char* PORTAL_INTERFACE = "org.freedesktop.impl.portal.RemoteDesktop";
 static const char* PORTAL_PATH = "/org/freedesktop/portal/desktop";
@@ -184,10 +177,31 @@ static void reply_failed(sdbus::MethodCall& call, const std::string& message) {
     call.createErrorReply(sdbus::Error(sdbus::Error::Name{PORTAL_ERROR_FAILED}, message)).send();
 }
 
+// HYPR_REMOTE_ALLOWED_APP_IDS: comma-separated app IDs allowed to Start a session.
+// Unset: only "" (host apps). An empty item means host apps; "*" allows all.
+static bool app_id_allowed(const std::string& app_id) {
+    static const std::vector<std::string> allowed = [] {
+        std::vector<std::string> out;
+        const char* env = std::getenv("HYPR_REMOTE_ALLOWED_APP_IDS");
+        std::string s = env ? env : "";
+        size_t start = 0;
+        while (true) {
+            size_t comma = s.find(',', start);
+            out.push_back(s.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return out;
+    }();
+    for (const auto& a : allowed)
+        if (a == "*" || a == app_id) return true;
+    return false;
+}
+
 // Use development name if requested, otherwise use standard name
 static const char* PORTAL_NAME = "org.freedesktop.impl.portal.desktop.hypr-remote";
 
-Portal::Portal() : libei_handler(nullptr), running(false) {
+Portal::Portal() : libei_handler(nullptr) {
 }
 
 Portal::~Portal() {
@@ -214,26 +228,6 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
         std::cout << "Portal interface: " << PORTAL_INTERFACE << std::endl;
 
         // Register RemoteDesktop interface methods with correct signatures
-        
-        
-        /*  */
-        
-        
-        
-        
-        
-        // Add the input notification methods that clients call to send input events
-        
-        
-        
-        
-        
-        
-        
-        
-        // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
-        
-        
         // Finalize the object
         object->addVTable(
             sdbus::MethodVTableItem{sdbus::MethodName{"CreateSession"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { CreateSession(std::move(call)); }, {}},
@@ -258,9 +252,6 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
             sdbus::SignalVTableItem{sdbus::SignalName{"SelectionTransfer"}, sdbus::Signature{"osu"}, {}, {}},
             sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
         ).forInterface(sdbus::InterfaceName{CLIPBOARD_INTERFACE});
-        
-        std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
-        std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
     } catch (const sdbus::Error& e) {
         std::cerr << "Failed to initialize D-Bus portal: " << e.what() << std::endl;
         std::cerr << "This is normal if another portal is already running or if running outside a desktop session." << std::endl;
@@ -280,7 +271,15 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
 }
 
 void Portal::cleanup() {
-    running = false;
+    // EIS server threads capture `this` and drive the virtual devices, so wait
+    // for them before anything is torn down. Idempotent: ~Portal calls this
+    // again, when the count is already 0.
+    eis_shutdown = true;
+    {
+        std::unique_lock<std::mutex> lk(eis_mtx);
+        if (!eis_cv.wait_for(lk, std::chrono::seconds(3), [this] { return eis_threads == 0; }))
+            std::cerr << eis_threads << " EIS thread(s) still running at shutdown" << std::endl;
+    }
 
     // Session objects must go before the connection. The clipboard thread has
     // been stopped by now (main stops it before cleanup()). Destroy them outside
@@ -309,8 +308,6 @@ void Portal::cleanup() {
 void Portal::run() {
     if (!connection) return;
     
-    running = true;
-    
     std::cout << "🔄 Starting proper sdbus D-Bus event loop..." << std::endl;
     std::cout << "📡 Portal ready to receive D-Bus calls!" << std::endl;
     
@@ -326,7 +323,8 @@ void Portal::run() {
 }
 
 void Portal::stop() {
-    running = false;
+    // EIS server threads see this within 100 ms; cleanup() waits for them.
+    eis_shutdown = true;
     // Exit the sdbus event loop cleanly
     if (connection) {
         connection->leaveEventLoop();
@@ -376,32 +374,6 @@ void Portal::CreateSession(sdbus::MethodCall call) {
     
     std::cout << "✅ CreateSession completed successfully" << std::endl;
     std::cout << "📋 NEXT: Client should call SelectDevices or Start" << std::endl;
-}
-
-void Portal::SelectSources(sdbus::MethodCall call) {
-    std::cout << "🔥 RemoteDesktop SelectSources called!" << std::endl;
-    
-    // Extract parameters
-    sdbus::ObjectPath session_handle;
-    std::map<std::string, sdbus::Variant> options;
-    call >> session_handle >> options;
-    
-    std::cout << "Session handle: " << session_handle << std::endl;
-    std::cout << "Options received:" << std::endl;
-    for (const auto& option : options) {
-        std::cout << "  " << option.first << std::endl;
-    }
-    
-    // Response - allow all sources
-    std::map<std::string, sdbus::Variant> response;
-    response["types"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
-    
-    auto reply = call.createReply();
-    reply << static_cast<uint32_t>(0); // Success
-    reply << response;
-    reply.send();
-    
-    std::cout << "✅ SelectSources completed for session: " << session_handle << std::endl;
 }
 
 void Portal::SelectDevices(sdbus::MethodCall call) {
@@ -488,6 +460,16 @@ void Portal::Start(sdbus::MethodCall call) {
         return;
     }
     
+    if (!app_id_allowed(app_id)) {
+        std::cout << "Start: denied for app_id '" << app_id
+                  << "' (not in HYPR_REMOTE_ALLOWED_APP_IDS)" << std::endl;
+        auto reply = call.createReply();
+        reply << static_cast<uint32_t>(2); // Other
+        reply << std::map<std::string, sdbus::Variant>{};
+        reply.send();
+        return;
+    }
+
     std::cout << "✅ Using existing LibEI handler for input processing" << std::endl;
     
     // Start the remote desktop session
@@ -499,8 +481,8 @@ void Portal::Start(sdbus::MethodCall call) {
     {
         std::lock_guard<std::mutex> lock(sessions_mtx);
         auto& state = sessions[session_handle];
-        state.started = true;
         clipboard_enabled = clipboard_enabled && state.clipboard_requested;
+        state.allowed = true;
     }
     if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
     std::cout << "Start: clipboard_enabled=" << (clipboard_enabled ? "true" : "false") << std::endl;
@@ -511,9 +493,16 @@ void Portal::Start(sdbus::MethodCall call) {
     reply.send();
 
     if (clipboard_enabled) {
+        std::string previous;
         {
             std::lock_guard<std::mutex> lock(sessions_mtx);
+            previous = clip_session;
             clip_session = session_handle;
+        }
+        if (!previous.empty() && previous != std::string(session_handle)) {
+            std::cout << "clipboard: session " << previous << " replaced by "
+                      << session_handle << std::endl;
+            clipboard->session_ended();  // before announce(): commands run in FIFO order
         }
         clipboard->announce();
     }
@@ -537,11 +526,14 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer via libei handler's virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_motion(time, dx, dy);
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -561,11 +553,14 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_button(time, static_cast<uint32_t>(button), state);
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -585,10 +580,13 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual keyboard
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->keyboard) {
         libei_handler->keyboard->send_key(time, static_cast<uint32_t>(keycode), state);
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -607,22 +605,25 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer with proper Wayland scroll protocol
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         // Set axis source for legacy scroll events
         libei_handler->pointer->send_axis_source(WL_POINTER_AXIS_SOURCE_WHEEL);
         
         // Send scroll events for both axes if non-zero
         if (dx != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
         }
         if (dy != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
         }
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -658,203 +659,138 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         return;
     }
     
-    // Create a socket pair - one end for deskflow, one end for our EIS server
-    int socket_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) == -1) {
-        std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
-        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to create socket pair")).send();
+    bool allowed = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto it = sessions.find(session_handle);
+        allowed = it != sessions.end() && it->second.allowed;
+    }
+    if (!allowed) {
+        std::cout << "ConnectToEIS: refused, session not started" << std::endl;
+        reply_failed(call, "Session not started");
         return;
     }
-    
-    int client_fd = socket_pair[0];  // This goes to deskflow
-    int server_fd = socket_pair[1];  // This stays with us for EIS server
-    
-    std::cout << "✅ Created socket pair - client_fd: " << client_fd << ", server_fd: " << server_fd << std::endl;
-    
-    // Start a thread to run a proper EIS server
-    std::thread([this, server_fd]() {
-        std::cout << "📡 Starting proper EIS server thread..." << std::endl;
-        
-        // Create EIS server context (similar to hyprland-eis)
-        struct eis* eis_context = eis_new(nullptr);
-        if (!eis_context) {
-            std::cerr << "Failed to create EIS server context" << std::endl;
-            close(server_fd);
-            return;
-        }
-        
-        // Set up logging (optional, for debugging)
-        // eis_log_set_priority(eis_context, EIS_LOG_PRIORITY_DEBUG);
-        
-        std::cout << "✅ EIS server context created" << std::endl;
-        
-        // Create a temporary socket and immediately connect our FD to it
-        // This is a workaround since libeis may not support direct FD setup
-        
-        // Alternative approach: Create a proper EIS server socket and handle the connection
-        char socket_path[256];
-        static std::atomic<unsigned> eis_session_counter{0};
-        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d-%u", getpid(), eis_session_counter++);
-        
-        // Setup EIS backend with temporary socket
-        int rc = eis_setup_backend_socket(eis_context, socket_path);
-        if (rc != 0) {
-            std::cerr << "Failed to setup EIS backend socket: " << strerror(errno) << std::endl;
-            eis_unref(eis_context);
-            close(server_fd);
-            return;
-        }
-        
-        std::cout << "✅ EIS backend socket created at: " << socket_path << std::endl;
-        
-        // Now we need to bridge between our socket_pair and the EIS socket
-        // Start a bridge thread to forward data between them
-        std::thread bridge_thread([server_fd, socket_path]() {
-            std::cout << "🌉 Starting socket bridge..." << std::endl;
-            
-            // Connect to the EIS socket
-            int eis_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (eis_sock == -1) {
-                std::cerr << "Failed to create bridge socket" << std::endl;
-                return;
-            }
-            
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-            
-            // Wait a bit for the EIS server to start
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            if (connect(eis_sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-                std::cerr << "Failed to connect to EIS socket: " << strerror(errno) << std::endl;
-                close(eis_sock);
-                return;
-            }
-            
-            std::cout << "✅ Bridge connected to EIS socket" << std::endl;
-            
-            // Bridge data bidirectionally between server_fd and eis_sock
-            fd_set read_fds;
-            char buffer[4096];
-            
-            // Make sockets non-blocking for better performance
-            int flags = fcntl(server_fd, F_GETFL, 0);
-            fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-            flags = fcntl(eis_sock, F_GETFL, 0);
-            fcntl(eis_sock, F_SETFL, flags | O_NONBLOCK);
-            
-            while (true) {
-                FD_ZERO(&read_fds);
-                FD_SET(server_fd, &read_fds);
-                FD_SET(eis_sock, &read_fds);
-                
-                int max_fd = std::max(server_fd, eis_sock);
-                struct timeval timeout = {0, 100000}; // 100ms timeout for better responsiveness
-                
-                int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
-                
-                if (activity < 0) {
-                    std::cerr << "Bridge select error: " << strerror(errno) << std::endl;
+
+    if (eis_shutdown.load()) {
+        reply_failed(call, "Shutting down");
+        return;
+    }
+
+    // libeis fd backend: libeis makes a socket pair and keeps one end; the other
+    // goes to deskflow. No socket file and no relay thread (CLIPBOARD-PLAN.md §3.2, S3).
+    struct eis* eis_context = eis_new(nullptr);
+    if (!eis_context || eis_setup_backend_fd(eis_context) != 0) {
+        std::cerr << "Failed to set up EIS fd backend" << std::endl;
+        if (eis_context) eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    int client_fd = eis_backend_fd_add_client(eis_context);
+    if (client_fd < 0) {
+        std::cerr << "Failed to add EIS client fd: " << strerror(-client_fd) << std::endl;
+        eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Count the thread before it exists, so that cleanup() can't miss it.
+    {
+        std::lock_guard<std::mutex> lock(eis_mtx);
+        ++eis_threads;
+    }
+
+    // From here on only the new thread touches eis_context.
+    try {
+        std::thread([this, eis_context]() {
+            // Declared first so that it runs last: after this, the thread no longer
+            // touches `this`.
+            struct Guard {
+                Portal* p;
+                ~Guard() {
+                    std::lock_guard<std::mutex> l(p->eis_mtx);
+                    --p->eis_threads;
+                    p->eis_cv.notify_all();
+                }
+            } guard{this};
+
+            std::cout << "🚀 Starting EIS server event loop..." << std::endl;
+
+            bool stop = false;
+            // libeis reports nothing if the fd is closed before the client ever
+            // connects, so give up on our own after a while.
+            bool connected = false;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            struct pollfd fds = {
+                .fd = eis_get_fd(eis_context),
+                .events = POLLIN,
+                .revents = 0,
+            };
+
+            while (!stop && !eis_shutdown.load()) {
+                if (!connected && std::chrono::steady_clock::now() >= deadline) {
+                    std::cout << "EIS: client never connected; stopping" << std::endl;
                     break;
                 }
-                
-                if (activity == 0) continue; // timeout
-                
-                // Forward data from deskflow (server_fd) to EIS server (eis_sock)
-                if (FD_ISSET(server_fd, &read_fds)) {
-                    ssize_t bytes = read(server_fd, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "Deskflow disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(eis_sock, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to EIS server" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from deskflow to EIS" << std::endl;
-                    }
+
+                int nevents = poll(&fds, 1, 100); // 100 ms, so that shutdown and the deadline are seen
+                if (nevents == -1) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
+                    break;
                 }
-                
-                // Forward data from EIS server (eis_sock) to deskflow (server_fd)
-                if (FD_ISSET(eis_sock, &read_fds)) {
-                    ssize_t bytes = read(eis_sock, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "EIS server disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(server_fd, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to deskflow" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from EIS to deskflow" << std::endl;
-                    }
+
+                if (nevents == 0) continue; // timeout
+
+                // Process all pending EIS events in one go - this is crucial for scroll
+                eis_dispatch(eis_context);
+
+                // Handle ALL events in the queue immediately
+                struct eis_event* event;
+                while ((event = eis_get_event(eis_context)) != nullptr) {
+
+                    // Handle EIS events and forward to virtual devices
+                    enum eis_event_type type = eis_event_get_type(event);
+                    if (type == EIS_EVENT_CLIENT_CONNECT) connected = true;
+                    bool client_gone = type == EIS_EVENT_CLIENT_DISCONNECT;
+                    handle_eis_event(event);
+                    eis_event_unref(event);
+                    if (client_gone) stop = true;
                 }
             }
-            
-            std::cout << "🌉 Socket bridge stopped" << std::endl;
-            close(eis_sock);
-        });
-        bridge_thread.detach();
-        
-        // Run the EIS server event loop (adapted from hyprland-eis)
-        std::cout << "🚀 Starting EIS server event loop..." << std::endl;
-        
-        bool stop = false;
-        struct pollfd fds = {
-            .fd = eis_get_fd(eis_context),
-            .events = POLLIN,
-            .revents = 0,
-        };
-        
-        while (!stop) {
-            int nevents = poll(&fds, 1, 100); // Reduced timeout to 100ms for better responsiveness
-            if (nevents == -1) {
-                std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
-                break;
-            }
-            
-            if (nevents == 0) continue; // timeout
-            
-            // Process all pending EIS events in one go - this is crucial for scroll
-            eis_dispatch(eis_context);
-            
-            // Handle ALL events in the queue immediately
-            struct eis_event* event;
-            while ((event = eis_get_event(eis_context)) != nullptr) {
-                
-                // Handle EIS events and forward to virtual devices
-                bool client_gone = eis_event_get_type(event) == EIS_EVENT_CLIENT_DISCONNECT;
-                handle_eis_event(event);
-                eis_event_unref(event);
-                if (client_gone) stop = true;
-            }
+
+            std::cout << "📡 EIS server thread stopped" << std::endl;
+            eis_unref(eis_context);
+        }).detach();
+    } catch (const std::system_error& e) {
+        std::cerr << "Failed to start EIS server thread: " << e.what() << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(eis_mtx);
+            --eis_threads;
         }
-        
-        std::cout << "📡 EIS server thread stopped" << std::endl;
-        unlink(socket_path); // Clean up socket file
+        eis_cv.notify_all();
         eis_unref(eis_context);
-        close(server_fd);
-    }).detach();
-    
-    // Return the client file descriptor to deskflow. UnixFd adopts client_fd
-    // (no dup) and closes it when it goes out of scope, after the reply is sent;
-    // the bus has its own copy by then. client_fd must not be closed elsewhere.
+        close(client_fd);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Return the client file descriptor to deskflow. client_fd comes from libeis
+    // (eis_backend_fd_add_client); libeis keeps its own end. UnixFd adopts
+    // client_fd (no dup), the bus dups it into the reply, and UnixFd closes our
+    // copy when it goes out of scope after the reply is sent. client_fd must not
+    // be closed elsewhere.
     sdbus::UnixFd unix_fd{client_fd, sdbus::adopt_fd};
     auto reply = call.createReply();
     reply << unix_fd;
     reply.send();
-    
-    std::cout << "✅ ConnectToEIS completed - socket fd sent to deskflow" << std::endl;
-    std::cout << "📡 Proper EIS server thread is running with socket bridge" << std::endl;
+
+    std::cout << "✅ ConnectToEIS completed - EIS client fd sent to deskflow" << std::endl;
 }
 
 void Portal::handle_eis_event(struct eis_event* event) {
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     enum eis_event_type type = eis_event_get_type(event);
     
     // Log all events for debugging
@@ -968,6 +904,9 @@ void Portal::handle_eis_event(struct eis_event* event) {
             struct eis_device* device = eis_event_get_device(event);
             std::cout << "🎮 EIS: Device started emulating: " << eis_device_get_name(device) << std::endl;
             g_current_monitor = -1; // cursor (re)entered this screen
+            // Pick up monitor changes here, not during motion. (The pointer region
+            // size is still fixed at SEAT_BIND; that limitation is unchanged.)
+            current_layout(true);
             g_abs.have_prev = false;
             break;
         }
@@ -996,6 +935,7 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_POINTER_MOTION_ABSOLUTE: {
             double x = eis_event_pointer_get_absolute_x(event);
             double y = eis_event_pointer_get_absolute_y(event);
+            if (!std::isfinite(x) || !std::isfinite(y)) break;
             
             
             // Forward to virtual pointer  
@@ -1047,12 +987,12 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 double scale_factor = 15.0; // Good default for smooth scrolling
                 
                 if (dx != 0.0) {
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor);
                     // Send axis stop to complete the scroll event
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
                 }
                 if (dy != 0.0) {
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy * scale_factor);
                     // Send axis stop to complete the scroll event  
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
                 }
@@ -1251,7 +1191,7 @@ void Portal::SessionClose(sdbus::MethodCall call, const std::string& session_han
 bool Portal::is_clip_session(const std::string& session_handle) {
     if (!clipboard || !clipboard->available()) return false;
     std::lock_guard<std::mutex> lock(sessions_mtx);
-    return !clip_session.empty() && clip_session == session_handle;
+    return clip_session == session_handle;
 }
 
 void Portal::RequestClipboard(sdbus::MethodCall call) {
