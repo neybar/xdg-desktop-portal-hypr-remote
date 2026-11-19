@@ -9,7 +9,10 @@ This is a fork of [gac3k/xdg-desktop-portal-hypr-remote](https://github.com/gac3
 - A layout clamp for the EIS regions.
 - Clipboard sharing through `org.freedesktop.impl.portal.Clipboard`, for text and `image/png`.
 - Quieter logging (no per-event output).
-- Fixes for file descriptor leaks (`ConnectToEIS`) and for the init-failure path.
+- EIS through libeis's fd backend: no socket or lock files in `/tmp`, no bridge thread, and EIS threads stopped cleanly at shutdown.
+- No file descriptor or EIS object leaks across client reconnects: devices follow the capabilities the client binds and are released on disconnect.
+- Hardening from a security review: an app-ID allow-list (see below), clipboard MIME-type validation and a cap on pending pastes, and sanitised pointer values.
+- Thread-safety fixes (one lock for all input paths, signal-safe shutdown), a fix for vertical smooth scroll, and no `hyprctl` calls during pointer motion.
 
 **Tested with:** Synergy 3.9.1 (Deskflow 1.26) on Hyprland 0.56.2. It should work with any RemoteDesktop portal client, but only that combination has been tested.
 
@@ -18,7 +21,6 @@ This is a fork of [gac3k/xdg-desktop-portal-hypr-remote](https://github.com/gac3
 **Known issues:**
 
 - Non-ASCII text copied from a Mac to Linux arrives garbled. This looks like Synergy's own conversion; laptop to Mac is exact.
-- About 2 file descriptors are leaked per Synergy reconnect, and a harmless "Failed to add device" line is logged on disconnect.
 
 ## Build and install (this fork)
 
@@ -113,6 +115,7 @@ hyprland-remote-desktop/
 ├── src/
 │   ├── main.cpp                    # Main application entry point
 │   ├── portal.cpp/.h               # D-Bus portal implementation
+│   ├── clipboard.cpp/.h            # Clipboard (ext-data-control-v1)
 │   ├── wayland_virtual_keyboard.cpp/.h  # Virtual keyboard protocol
 │   ├── wayland_virtual_pointer.cpp/.h   # Virtual pointer protocol
 │   └── libei_handler.cpp/.h        # LibEI event processing
