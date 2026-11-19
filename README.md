@@ -13,7 +13,7 @@ This is a fork of [gac3k/xdg-desktop-portal-hypr-remote](https://github.com/gac3
 
 **Tested with:** Synergy 3.9.1 (Deskflow 1.26) on Hyprland 0.56.2. It should work with any RemoteDesktop portal client, but only that combination has been tested.
 
-**Security caveat (from upstream):** the portal approves every remote-input request without showing a prompt. Anything that can talk to it on your session bus can get input access.
+**Security caveat:** the portal approves remote-input and clipboard requests without a prompt, but only from host apps (`app_id` empty), such as Synergy run as a systemd user service. Sandboxed apps (Flatpak, Snap) are refused unless their app ID is listed in `HYPR_REMOTE_ALLOWED_APP_IDS` (comma-separated; an empty item means host apps; `*` allows all). Set it with `systemctl --user edit xdg-desktop-portal-hypr-remote`, adding `[Service]` / `Environment=HYPR_REMOTE_ALLOWED_APP_IDS=,org.example.App`. Any unsandboxed process on your session bus can still call the portal directly.
 
 **Known issues:**
 
