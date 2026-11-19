@@ -18,9 +18,7 @@ This is a fork of [gac3k/xdg-desktop-portal-hypr-remote](https://github.com/gac3
 
 **Security caveat:** the portal approves remote-input and clipboard requests without a prompt, but only from host apps (`app_id` empty), such as Synergy run as a systemd user service. Sandboxed apps (Flatpak, Snap) are refused unless their app ID is listed in `HYPR_REMOTE_ALLOWED_APP_IDS` (comma-separated; an empty item means host apps; `*` allows all). Set it with `systemctl --user edit xdg-desktop-portal-hypr-remote`, adding `[Service]` / `Environment=HYPR_REMOTE_ALLOWED_APP_IDS=,org.example.App`. Any unsandboxed process on your session bus can still call the portal directly.
 
-**Known issues:**
-
-- Non-ASCII text copied from a Mac to Linux arrives garbled. This looks like Synergy's own conversion; laptop to Mac is exact.
+**Unicode:** text is passed through byte for byte. A Mac-to-Linux test with Greek, Cyrillic, CJK, RTL scripts, emoji (including ZWJ sequences and flags), non-BMP characters, combining marks and zero-width characters arrived exact. If you test with `pbcopy` over ssh, set `LANG=en_US.UTF-8` first, or `pbcopy` itself garbles UTF-8.
 
 ## Build and install (this fork)
 
