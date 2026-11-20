@@ -1,0 +1,50 @@
+# Maintainer: neybar <https://github.com/neybar>
+#
+# Builds the neybar fork of xdg-desktop-portal-hypr-remote, which adds to the
+# upstream RemoteDesktop backend: a port to sdbus-c++ 2.x (so it builds on
+# current Arch), a real monitor-layout pointer region, an
+# org.freedesktop.impl.portal.Clipboard implementation, and a round of
+# hardening/reliability fixes. See the repository README for details.
+#
+# This is a -git package: it builds from the current main of the fork.
+pkgname=xdg-desktop-portal-hypr-remote-git
+_pkgname=xdg-desktop-portal-hypr-remote
+pkgver=0.r0.0000000
+pkgrel=1
+pkgdesc='RemoteDesktop + Clipboard portal backend for Hyprland (neybar fork)'
+arch=(x86_64)
+url="https://github.com/neybar/xdg-desktop-portal-hypr-remote"
+license=(MIT)
+depends=(libei sdbus-cpp xdg-desktop-portal)
+makedepends=(cmake git hyprland-protocols systemd wayland-protocols)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$_pkgname"
+	printf '0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+	cmake -B build -S "$_pkgname" -W no-author \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBEXECDIR=bin \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+
+	# CMake installs the portal file and binary; the generated D-Bus activation
+	# file and systemd user unit still need placing by hand.
+	install -Dm644 build/org.freedesktop.impl.portal.desktop.hypr-remote.service \
+		"$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.hypr-remote.service"
+	install -Dm644 build/contrib/systemd/xdg-desktop-portal-hypr-remote.service \
+		"$pkgdir/usr/lib/systemd/user/xdg-desktop-portal-hypr-remote.service"
+
+	install -Dm644 "$_pkgname/LICENSE" \
+		"$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

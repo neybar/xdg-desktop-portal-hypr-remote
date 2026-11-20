@@ -60,7 +60,16 @@ org.freedesktop.impl.portal.Clipboard=hypr-remote
 
 and restart: `systemctl --user restart xdg-desktop-portal`.
 
-Arch packaging is not part of this repo.
+### Arch Linux
+
+A `PKGBUILD` is provided in [`packaging/arch/`](packaging/arch/PKGBUILD). It is a `-git` package that builds from the current `main`:
+
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+It installs the binary, the `Clipboard`/`RemoteDesktop` portal file, the D-Bus activation file and the systemd user unit, then restart `xdg-desktop-portal` as above. It `provides`/`conflicts` `xdg-desktop-portal-hypr-remote`, so it replaces any other build of this backend.
 
 ## Development build
 
